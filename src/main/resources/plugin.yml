@@ -1,0 +1,10 @@
+name: ZornoElyPvP
+version: 1.0-SNAPSHOT
+main: com.zornoely.pvp.ZornoElyPvP
+api-version: '1.21'
+author: ZornoEly
+commands:
+  duel:
+    description: ZornoEly Duello ve PvP Komutu
+    aliases: [duello, pvp]
+    
