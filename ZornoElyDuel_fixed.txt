@@ -1,0 +1,1613 @@
+// ==========================================================
+// DOSYA: src/main/java/com/zornoely/duel/ZornoElyDuel.java
+// ==========================================================
+package com.zornoely.duel;
+
+import org.bukkit.Bukkit;
+import org.bukkit.Location;
+import org.bukkit.World;
+import org.bukkit.entity.Player;
+import org.bukkit.plugin.java.JavaPlugin;
+
+import java.util.List;
+import java.util.logging.Level;
+
+public class ZornoElyDuel extends JavaPlugin {
+    private static ZornoElyDuel instance;
+    private ArenaManager arenaManager;
+    private DuelManager duelManager;
+    private QueueManager queueManager;
+    private LootManager lootManager;
+    private InviteManager inviteManager;
+
+    public static ZornoElyDuel getInstance() { return instance; }
+
+    @Override
+    public void onEnable() {
+        instance = this;
+        saveDefaultConfig();
+
+        arenaManager  = new ArenaManager(this);
+        lootManager   = new LootManager(this);
+        inviteManager = new InviteManager(this);
+        duelManager   = new DuelManager(this);
+        queueManager  = new QueueManager(this);
+
+        arenaManager.load();
+
+        DuelCommand cmd = new DuelCommand(this);
+        getCommand("duel").setExecutor(cmd);
+        getCommand("duel").setTabCompleter(cmd);
+        Bukkit.getPluginManager().registerEvents(new DuelListener(this), this);
+
+        // Her saniye: düello süresi, ganimet süresi + geri sayım, davet temizliği, sıra eşleştirme
+        Bukkit.getScheduler().runTaskTimer(this, () -> {
+            safe("düello süresi", () -> duelManager.checkTimeouts());
+            safe("ganimet", () -> lootManager.tick());
+            safe("davet", () -> inviteManager.cleanupExpired());
+            safe("sıra", () -> queueManager.processQueues());
+        }, 20L, 20L);
+
+        getLogger().info("ZornoElyDuel aktif!");
+    }
+
+    @Override
+    public void onDisable() {
+        try {
+            if (lootManager != null) lootManager.flushAll();   // bekleyen ganimetler oyunculara verilir
+            if (arenaManager != null) {
+                arenaManager.restoreAll();                      // Trap'te konan bloklar geri alınır
+                arenaManager.save();
+            }
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "Kapanış hatası", t);
+        }
+    }
+
+    private void safe(String name, Runnable task) {
+        try {
+            task.run();
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "Task hatası (" + name + ")", t);
+        }
+    }
+
+    /** Hub komutu çalışmazsa kullanılacak yedek nokta: ana dünyanın spawn'ı. */
+    public Location getFallbackSpawn() {
+        List<World> worlds = Bukkit.getWorlds();
+        return worlds.isEmpty() ? null : worlds.get(0).getSpawnLocation();
+    }
+
+    public void sendToHub(Player player) {
+        if (player == null || !player.isOnline() || !isEnabled()) return;
+        Bukkit.getScheduler().runTask(this, () -> {
+            if (!player.isOnline()) return;
+            String cmd = getConfig().getString("settings.hub-command", "hub");
+            cmd = cmd == null ? "" : cmd.trim();
+            if (cmd.startsWith("/")) cmd = cmd.substring(1);
+            
+            boolean success = false;
+            if (!cmd.isEmpty()) {
+                try {
+                    success = player.performCommand(cmd);
+                } catch (Exception ignored) {}
+            }
+            
+            if (!success) {
+                Location spawn = getFallbackSpawn();
+                if (spawn != null) player.teleport(spawn);
+            }
+        });
+    }
+
+    public ArenaManager getArenaManager()     { return arenaManager; }
+    public DuelManager getDuelManager()       { return duelManager; }
+    public QueueManager getQueueManager()     { return queueManager; }
+    public LootManager getLootManager()       { return lootManager; }
+    public InviteManager getInviteManager()   { return inviteManager; }
+}
+
+// ==========================================================
+// DOSYA: src/main/java/com/zornoely/duel/ArenaType.java
+// ==========================================================
+package com.zornoely.duel;
+
+import java.util.Locale;
+
+public enum ArenaType {
+    ELYTRA("Elytra PvP"),
+    TRAP("Trap PvP"),
+    HEPSI("Hepsi");
+
+    private final String displayName;
+
+    ArenaType(String displayName) { this.displayName = displayName; }
+
+    public String getDisplayName() { return displayName; }
+
+    /** Komutlar için: geçersiz yazılırsa null döner. Locale.ROOT: Türkçe i/İ sorunu olmasın. */
+    public static ArenaType fromString(String s) {
+        if (s == null) return null;
+        try { return ArenaType.valueOf(s.trim().toUpperCase(Locale.ROOT)); }
+        catch (IllegalArgumentException e) { return null; }
+    }
+
+    /** Config okurken: geçersizse HEPSI. */
+    public static ArenaType parse(String s) {
+        ArenaType t = fromString(s);
+        return t == null ? HEPSI : t;
+    }
+}
+
+// ==========================================================
+// DOSYA: src/main/java/com/zornoely/duel/Arena.java
+// ==========================================================
+package com.zornoely.duel;
+
+import org.bukkit.Bukkit;
+import org.bukkit.Location;
+import org.bukkit.World;
+import org.bukkit.block.BlockState;
+
+import java.util.ArrayDeque;
+import java.util.Deque;
+
+public class Arena {
+
+    /** Dünya henüz yüklenmemiş olsa bile koordinatlar kaybolmasın diye ham saklanır. */
+    public static class Spot {
+        public final String world;
+        public final double x, y, z;
+        public final float yaw, pitch;
+
+        public Spot(String world, double x, double y, double z, float yaw, float pitch) {
+            this.world = world;
+            this.x = x;
+            this.y = y;
+            this.z = z;
+            this.yaw = yaw;
+            this.pitch = pitch;
+        }
+
+        public static Spot of(Location l) {
+            if (l == null || l.getWorld() == null) return null;
+            return new Spot(l.getWorld().getName(), l.getX(), l.getY(), l.getZ(), l.getYaw(), l.getPitch());
+        }
+
+        public Location toLocation() {
+            World w = Bukkit.getWorld(world);
+            return w == null ? null : new Location(w, x, y, z, yaw, pitch);
+        }
+    }
+
+    private static final int MAX_RECORDED_BLOCKS = 20000;
+
+    private final String name;
+    private Spot spawn1;
+    private Spot spawn2;
+    private ArenaType type = ArenaType.HEPSI;
+    private boolean busy = false;
+    private final Deque<BlockState> placedBlocks = new ArrayDeque<>();
+
+    public Arena(String name) { this.name = name; }
+
+    public String getName()           { return name; }
+
+    public Location getSpawn1()       { return spawn1 == null ? null : spawn1.toLocation(); }
+    public Location getSpawn2()       { return spawn2 == null ? null : spawn2.toLocation(); }
+    public Spot getRawSpawn1()        { return spawn1; }
+    public Spot getRawSpawn2()        { return spawn2; }
+    public void setSpawn1(Location l) { this.spawn1 = Spot.of(l); }
+    public void setSpawn2(Location l) { this.spawn2 = Spot.of(l); }
+    public void setRawSpawn1(Spot s)  { this.spawn1 = s; }
+    public void setRawSpawn2(Spot s)  { this.spawn2 = s; }
+
+    public ArenaType getType()        { return type; }
+    public void setType(ArenaType t)  { this.type = t; }
+    public boolean isBusy()           { return busy; }
+    public void setBusy(boolean b)    { this.busy = b; }
+
+    /** İki spawn da tanımlı VE dünyaları yüklü olmalı. */
+    public boolean isReady() { return getSpawn1() != null && getSpawn2() != null; }
+
+    public boolean matchesType(ArenaType required) {
+        return type == ArenaType.HEPSI
+            || required == ArenaType.HEPSI
+            || type == required;
+    }
+
+    /** Düello sırasında konan bloğun eski halini kaydeder (maç bitince geri alınır). */
+    public void recordBlock(BlockState replacedState) {
+        if (replacedState == null || placedBlocks.size() >= MAX_RECORDED_BLOCKS) return;
+        placedBlocks.push(replacedState);
+    }
+
+    /** Kaydedilen blokları en yeniden en eskiye doğru eski haline döndürür. */
+    public void restoreBlocks() {
+        BlockState st;
+        while ((st = placedBlocks.poll()) != null) {
+            try { st.update(true, false); }
+            catch (Exception ignored) { }
+        }
+    }
+}
+
+// ==========================================================
+// DOSYA: src/main/java/com/zornoely/duel/Duel.java
+// ==========================================================
+package com.zornoely.duel;
+
+import java.util.HashSet;
+import java.util.Set;
+import java.util.UUID;
+
+public class Duel {
+    private final UUID player1;
+    private final UUID player2;
+    private final String arenaName;
+    private final ArenaType mode;
+    private final long startTime;
+    private final Set<UUID> drawVotes = new HashSet<>();
+
+    public Duel(UUID p1, UUID p2, String arena, ArenaType mode) {
+        this.player1 = p1;
+        this.player2 = p2;
+        this.arenaName = arena;
+        this.mode = mode;
+        this.startTime = System.currentTimeMillis();
+    }
+
+    public UUID getPlayer1()        { return player1; }
+    public UUID getPlayer2()        { return player2; }
+    public String getArenaName()    { return arenaName; }
+    public ArenaType getMode()      { return mode; }
+    public long getStartTime()      { return startTime; }
+
+    /** Berabere teklif eden oyuncular (iki taraf da yazarsa düello berabere biter). */
+    public Set<UUID> getDrawVotes() { return drawVotes; }
+
+    public UUID getOpponent(UUID me) {
+        if (me.equals(player1)) return player2;
+        if (me.equals(player2)) return player1;
+        return null;
+    }
+
+    public boolean contains(UUID uuid) {
+        return uuid.equals(player1) || uuid.equals(player2);
+    }
+}
+
+// ==========================================================
+// DOSYA: src/main/java/com/zornoely/duel/ArenaManager.java
+// ==========================================================
+package com.zornoely.duel;
+
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+public class ArenaManager {
+    private static final Pattern NAME_PATTERN = Pattern.compile("[A-Za-z0-9_\\-]{1,32}");
+
+    private final ZornoElyDuel plugin;
+    private final Map<String, Arena> arenas = new LinkedHashMap<>();
+    private final File file;
+    private FileConfiguration data = new YamlConfiguration();
+
+    public ArenaManager(ZornoElyDuel plugin) {
+        this.plugin = plugin;
+        this.file = new File(plugin.getDataFolder(), "arenas.yml");
+    }
+
+    /** Nokta vs. içeren isimler YAML yolunu bozar, o yüzden sadece güvenli karakterler. */
+    public static boolean isValidName(String name) {
+        return name != null && NAME_PATTERN.matcher(name).matches();
+    }
+
+    public void load() {
+        try {
+            if (!file.exists()) {
+                plugin.getDataFolder().mkdirs();
+                file.createNewFile();
+            }
+        } catch (IOException e) {
+            plugin.getLogger().severe("arenas.yml oluşturulamadı: " + e.getMessage());
+        }
+        data = YamlConfiguration.loadConfiguration(file);
+        arenas.clear();
+        ConfigurationSection sec = data.getConfigurationSection("arenas");
+        if (sec == null) return;
+        for (String name : sec.getKeys(false)) {
+            ConfigurationSection s = sec.getConfigurationSection(name);
+            if (s == null) continue;
+            Arena a = new Arena(name);
+            a.setRawSpawn1(loadSpot(s.getConfigurationSection("spawn1")));
+            a.setRawSpawn2(loadSpot(s.getConfigurationSection("spawn2")));
+            a.setType(ArenaType.parse(s.getString("type", "HEPSI")));
+            arenas.put(name, a);
+        }
+    }
+
+    public void save() {
+        data.set("arenas", null);
+        for (Arena a : arenas.values()) {
+            String path = "arenas." + a.getName();
+            saveSpot(path + ".spawn1", a.getRawSpawn1());
+            saveSpot(path + ".spawn2", a.getRawSpawn2());
+            data.set(path + ".type", a.getType().name());
+        }
+        try { data.save(file); }
+        catch (IOException e) { plugin.getLogger().severe("Kaydedilemedi: " + e.getMessage()); }
+    }
+
+    private void saveSpot(String path, Arena.Spot s) {
+        if (s == null) return;
+        data.set(path + ".world", s.world);
+        data.set(path + ".x", s.x);
+        data.set(path + ".y", s.y);
+        data.set(path + ".z", s.z);
+        data.set(path + ".yaw", s.yaw);
+        data.set(path + ".pitch", s.pitch);
+    }
+
+    private Arena.Spot loadSpot(ConfigurationSection s) {
+        if (s == null) return null;
+        String w = s.getString("world");
+        if (w == null) return null;
+        return new Arena.Spot(w,
+                s.getDouble("x"), s.getDouble("y"), s.getDouble("z"),
+                (float) s.getDouble("yaw"), (float) s.getDouble("pitch"));
+    }
+
+    /** Büyük/küçük harf fark etmez. */
+    public Arena get(String name) {
+        if (name == null) return null;
+        Arena a = arenas.get(name);
+        if (a != null) return a;
+        for (Arena x : arenas.values()) {
+            if (x.getName().equalsIgnoreCase(name)) return x;
+        }
+        return null;
+    }
+
+    public Collection<Arena> getAll()      { return arenas.values(); }
+    public Set<String> getNames()          { return arenas.keySet(); }
+    public boolean exists(String name)     { return get(name) != null; }
+
+    public Arena create(String name) {
+        if (!isValidName(name) || get(name) != null) return null;
+        Arena a = new Arena(name);
+        arenas.put(name, a);
+        return a;
+    }
+
+    public boolean delete(String name) {
+        Arena a = get(name);
+        if (a == null) return false;
+        a.restoreBlocks();
+        arenas.remove(a.getName());
+        return true;
+    }
+
+    public Arena findAvailable(ArenaType required) {
+        for (Arena a : arenas.values()) {
+            if (!a.isBusy() && a.isReady() && a.matchesType(required)) return a;
+        }
+        return null;
+    }
+
+    /** Arenayı boşa çıkarır ve maçta konan blokları geri alır. */
+    public void release(String arenaName) {
+        Arena a = arenas.get(arenaName);
+        if (a == null) return;
+        a.restoreBlocks();
+        a.setBusy(false);
+    }
+
+    public void restoreAll() {
+        for (Arena a : arenas.values()) a.restoreBlocks();
+    }
+}
+
+// ==========================================================
+// DOSYA: src/main/java/com/zornoely/duel/DuelManager.java
+// ==========================================================
+package com.zornoely.duel;
+
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.Location;
+import org.bukkit.entity.Player;
+
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+
+public class DuelManager {
+    private final ZornoElyDuel plugin;
+    private final Map<UUID, Duel> activeDuels = new HashMap<>();
+    private final Set<UUID> killedInDuel = new HashSet<>();
+    private final int durationMinutes;
+
+    public DuelManager(ZornoElyDuel plugin) {
+        this.plugin = plugin;
+        this.durationMinutes = Math.max(1, plugin.getConfig().getInt("settings.duel-duration-minutes", 15));
+    }
+
+    public Duel getDuel(UUID uuid)      { return activeDuels.get(uuid); }
+    public boolean isInDuel(UUID uuid)  { return activeDuels.containsKey(uuid); }
+
+    /** Moddaki aktif maç sayısı (her düello 2 kez map'te olduğu için Set'e çevrilir). */
+    public int countActive(ArenaType mode) {
+        int count = 0;
+        for (Duel d : new HashSet<>(activeDuels.values())) {
+            if (d.getMode() == mode) count++;
+        }
+        return count;
+    }
+
+    public Duel startDuel(Player p1, Player p2, ArenaType mode) {
+        if (p1 == null || p2 == null || !p1.isOnline() || !p2.isOnline()) return null;
+        if (p1.getUniqueId().equals(p2.getUniqueId())) return null;
+        if (isInDuel(p1.getUniqueId()) || isInDuel(p2.getUniqueId())) return null;
+
+        Arena arena = plugin.getArenaManager().findAvailable(mode);
+        if (arena == null) {
+            String msg = ChatColor.RED + "Bu mod için uygun boş arena bulunamadı!";
+            p1.sendMessage(msg);
+            p2.sendMessage(msg);
+            return null;
+        }
+        Location s1 = arena.getSpawn1();
+        Location s2 = arena.getSpawn2();
+        if (s1 == null || s2 == null) return null;
+
+        arena.setBusy(true);
+        // Sırada bekliyorlarsa sıradan çıkar (aksi halde başka maça da çekilebilirlerdi)
+        plugin.getQueueManager().removeFromAll(p1.getUniqueId());
+        plugin.getQueueManager().removeFromAll(p2.getUniqueId());
+
+        Duel duel = new Duel(p1.getUniqueId(), p2.getUniqueId(), arena.getName(), mode);
+        activeDuels.put(p1.getUniqueId(), duel);
+        activeDuels.put(p2.getUniqueId(), duel);
+
+        p1.closeInventory();
+        p2.closeInventory();
+        p1.teleport(s1);
+        p2.teleport(s2);
+
+        String msg = ChatColor.GREEN + "Düello başladı! Mod: " + ChatColor.YELLOW + mode.getDisplayName()
+                + ChatColor.GREEN + " | Arena: " + ChatColor.YELLOW + arena.getName()
+                + ChatColor.GREEN + " | Süre: " + ChatColor.YELLOW + durationMinutes + " dk";
+        p1.sendMessage(msg);
+        p2.sendMessage(msg);
+        String hint = ChatColor.GRAY + "Beraberlik için iki oyuncu da /duel berabere yazmalı.";
+        p1.sendMessage(hint);
+        p2.sendMessage(hint);
+        return duel;
+    }
+
+    public void endDuel(Duel duel, UUID winnerUuid, String reason) {
+        endDuel(duel, winnerUuid, reason, false);
+    }
+
+    /**
+     * @param holdArena true ise arena boşa çıkarılmaz; ganimet süreci bitince LootManager boşaltır
+     *                  (kazanan arenada ganimet alırken yeni maç başlamasın diye).
+     */
+    public void endDuel(Duel duel, UUID winnerUuid, String reason, boolean holdArena) {
+        if (duel == null) return;
+        boolean removed1 = activeDuels.remove(duel.getPlayer1(), duel);
+        boolean removed2 = activeDuels.remove(duel.getPlayer2(), duel);
+        if (!removed1 && !removed2) return;   // bu düello zaten bitmiş
+        if (!holdArena) plugin.getArenaManager().release(duel.getArenaName());
+    }
+
+    public void checkTimeouts() {
+        if (activeDuels.isEmpty()) return;
+        long limit = durationMinutes * 60_000L;
+        long now = System.currentTimeMillis();
+        Set<Duel> toEnd = new HashSet<>();
+        for (Duel d : activeDuels.values()) {
+            if (now - d.getStartTime() >= limit) toEnd.add(d);
+        }
+        for (Duel d : toEnd) {
+            endDuel(d, null, "TIMEOUT");
+            Player p1 = Bukkit.getPlayer(d.getPlayer1());
+            Player p2 = Bukkit.getPlayer(d.getPlayer2());
+            String msg = ChatColor.RED + "Düello süresi doldu, berabere bitti!";
+            if (p1 != null) p1.sendMessage(msg);
+            if (p2 != null) p2.sendMessage(msg);
+            plugin.sendToHub(p1);
+            plugin.sendToHub(p2);
+        }
+    }
+
+    public void markKilled(UUID uuid)         { killedInDuel.add(uuid); }
+    public boolean wasKilledInDuel(UUID uuid) { return killedInDuel.remove(uuid); }
+    public void forget(UUID uuid)             { killedInDuel.remove(uuid); }
+}
+
+// ==========================================================
+// DOSYA: src/main/java/com/zornoely/duel/QueueManager.java
+// ==========================================================
+package com.zornoely.duel;
+
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.entity.Player;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+public class QueueManager {
+    private final ZornoElyDuel plugin;
+    private final List<UUID> elytraQueue = new ArrayList<>();
+    private final List<UUID> trapQueue = new ArrayList<>();
+
+    public QueueManager(ZornoElyDuel plugin) { this.plugin = plugin; }
+
+    public List<UUID> getQueue(ArenaType mode) {
+        return mode == ArenaType.ELYTRA ? elytraQueue : trapQueue;
+    }
+
+    public boolean isInQueue(UUID uuid, ArenaType mode) {
+        return getQueue(mode).contains(uuid);
+    }
+
+    public void toggleQueue(Player p, ArenaType mode) {
+        UUID id = p.getUniqueId();
+        List<UUID> queue = getQueue(mode);
+
+        if (queue.contains(id)) {
+            queue.remove(id);
+            p.sendMessage(ChatColor.RED + mode.getDisplayName() + " sırasından çıktın!");
+            return;
+        }
+        if (plugin.getDuelManager().isInDuel(id)) {
+            p.sendMessage(ChatColor.RED + "Düellodayken sıraya giremezsin!");
+            return;
+        }
+        if (plugin.getLootManager().hasLoot(id)) {
+            p.sendMessage(ChatColor.RED + "Önce ganimetini almalısın! (/duel sandik)");
+            return;
+        }
+
+        getQueue(mode == ArenaType.ELYTRA ? ArenaType.TRAP : ArenaType.ELYTRA).remove(id);
+        queue.add(id);
+        p.sendMessage(ChatColor.GREEN + mode.getDisplayName() + " sırasına girdin!");
+        tryMatch(mode);
+
+        if (queue.contains(id) && queue.size() >= 2) {
+            p.sendMessage(ChatColor.YELLOW + "Şu an boş arena yok, arena boşalınca düello otomatik başlayacak.");
+        }
+    }
+
+    /** Her saniye çağrılır: arena boşalınca bekleyenler otomatik eşleşir. */
+    public void processQueues() {
+        tryMatch(ArenaType.ELYTRA);
+        tryMatch(ArenaType.TRAP);
+    }
+
+    private void tryMatch(ArenaType mode) {
+        List<UUID> queue = getQueue(mode);
+        if (queue.isEmpty()) return;
+
+        queue.removeIf(id -> {
+            Player pl = Bukkit.getPlayer(id);
+            return pl == null || !pl.isOnline()
+                    || plugin.getDuelManager().isInDuel(id)
+                    || plugin.getLootManager().hasLoot(id);
+        });
+
+        while (queue.size() >= 2 && plugin.getArenaManager().findAvailable(mode) != null) {
+            UUID u1 = queue.remove(0);
+            UUID u2 = queue.remove(0);
+            Player p1 = Bukkit.getPlayer(u1);
+            Player p2 = Bukkit.getPlayer(u2);
+            if (p1 == null || p2 == null) {
+                if (p1 != null) queue.add(0, u1);
+                if (p2 != null) queue.add(0, u2);
+                continue;
+            }
+            if (plugin.getDuelManager().startDuel(p1, p2, mode) == null) {
+                queue.add(0, u2);
+                queue.add(0, u1);
+                break;
+            }
+        }
+    }
+
+    public void removeFromAll(UUID uuid) {
+        elytraQueue.remove(uuid);
+        trapQueue.remove(uuid);
+    }
+}
+
+// ==========================================================
+// DOSYA: src/main/java/com/zornoely/duel/LootManager.java
+// ==========================================================
+package com.zornoely.duel;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.format.TextDecoration;
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.Material;
+import org.bukkit.entity.Player;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.InventoryHolder;
+import org.bukkit.inventory.ItemStack;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+
+public class LootManager {
+    public static final Component LOOT_TITLE = Component.text("» Ganimet Sandığı", NamedTextColor.DARK_RED);
+    private static final int MAX_SLOTS = 54;
+
+    public static class LootHolder implements InventoryHolder {
+        private Inventory inventory;
+        void setInventory(Inventory inventory) { this.inventory = inventory; }
+        @Override public Inventory getInventory() { return inventory; }
+    }
+
+    private final ZornoElyDuel plugin;
+    private final Map<UUID, List<ItemStack>> loots = new HashMap<>();
+    private final Map<UUID, Long> expireTimes = new HashMap<>();
+    private final Map<UUID, String> heldArenas = new HashMap<>();   // ganimet bitene kadar meşgul tutulan arena
+    private final Set<UUID> openInventories = new HashSet<>();
+    private final int durationSeconds;
+
+    public LootManager(ZornoElyDuel plugin) {
+        this.plugin = plugin;
+        this.durationSeconds = Math.max(1, plugin.getConfig().getInt("settings.loot-duration-seconds", 20));
+    }
+
+    public void setLoot(UUID uuid, List<ItemStack> items, String arenaName) {
+        List<ItemStack> list = loots.computeIfAbsent(uuid, k -> new ArrayList<>());
+        list.addAll(items);
+        expireTimes.put(uuid, System.currentTimeMillis() + durationSeconds * 1000L);
+
+        if (arenaName != null) {
+            String old = heldArenas.put(uuid, arenaName);
+            if (old != null && !old.equals(arenaName)) plugin.getArenaManager().release(old);
+        }
+
+        Player p = Bukkit.getPlayer(uuid);
+        if (p != null && p.isOnline()) {
+            p.sendMessage(ChatColor.GREEN + "Ganimet hazır! " + ChatColor.YELLOW + durationSeconds
+                    + " saniye içinde /duel sandik ile aç.");
+            sendBar(p, durationSeconds);
+        }
+    }
+
+    public boolean hasLoot(UUID uuid) {
+        Long t = expireTimes.get(uuid);
+        return t != null && System.currentTimeMillis() < t && loots.containsKey(uuid);
+    }
+
+    public void openLoot(Player p) {
+        UUID uuid = p.getUniqueId();
+        if (!hasLoot(uuid)) {
+            p.sendMessage(ChatColor.RED + "Aktif bir ganimet sandığınız yok!");
+            return;
+        }
+        if (openInventories.contains(uuid)) return;
+
+        List<ItemStack> items = loots.get(uuid);
+        if (items.size() > MAX_SLOTS) {
+            // Sandığa sığmayan fazlalık kaybolmasın: doğrudan envantere ver
+            List<ItemStack> extra = new ArrayList<>(items.subList(MAX_SLOTS, items.size()));
+            items.subList(MAX_SLOTS, items.size()).clear();
+            giveOrDrop(p, extra);
+        }
+
+        int rows = Math.max(1, (items.size() + 8) / 9);
+        LootHolder holder = new LootHolder();
+        Inventory inv = Bukkit.createInventory(holder, rows * 9, LOOT_TITLE);
+        holder.setInventory(inv);
+        for (int i = 0; i < items.size(); i++) inv.setItem(i, items.get(i));
+
+        if (p.openInventory(inv) != null) openInventories.add(uuid);
+    }
+
+    public void onInventoryClose(Player p, Inventory inv) {
+        UUID uuid = p.getUniqueId();
+        if (!openInventories.remove(uuid)) return;
+        if (!loots.containsKey(uuid)) return;
+
+        List<ItemStack> remaining = new ArrayList<>();
+        for (ItemStack it : inv.getContents()) {
+            if (it != null && it.getType() != Material.AIR) remaining.add(it);
+        }
+
+        if (remaining.isEmpty()) {
+            finish(uuid);
+            plugin.sendToHub(p);
+        } else {
+            loots.put(uuid, remaining);
+        }
+    }
+
+    /** Her saniye çağrılır: süresi dolanları kapatır, kalanlara geri sayımı gösterir. */
+    public void tick() {
+        if (expireTimes.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        for (UUID uuid : new ArrayList<>(expireTimes.keySet())) {
+            Long t = expireTimes.get(uuid);
+            if (t == null) continue;
+            Player p = Bukkit.getPlayer(uuid);
+            if (now >= t) {
+                expireLoot(uuid, p);
+            } else if (p != null && p.isOnline()) {
+                sendBar(p, (int) Math.ceil((t - now) / 1000.0));
+            }
+        }
+    }
+
+    private void expireLoot(UUID uuid, Player p) {
+        boolean wasOpen = openInventories.contains(uuid);
+        finish(uuid);   // openInventories'den de çıkarır, böylece close eventi bir şey yapmaz
+        if (p != null && p.isOnline()) {
+            if (wasOpen) p.closeInventory();   // açık sandık süre bitince kapanır, kalan eşyalar gider
+            p.sendMessage(ChatColor.RED + "Ganimet süren doldu!");
+            plugin.sendToHub(p);
+        }
+    }
+
+    /** Ganimet sürecini bitirir ve tutulan arenayı boşa çıkarır. */
+    private void finish(UUID uuid) {
+        loots.remove(uuid);
+        expireTimes.remove(uuid);
+        openInventories.remove(uuid);
+        String arena = heldArenas.remove(uuid);
+        if (arena != null) plugin.getArenaManager().release(arena);
+    }
+
+    /** Oyuncu çıkınca çağrılır. */
+    public void remove(UUID uuid) {
+        finish(uuid);
+    }
+
+    /** Eklenti kapanırken bekleyen ganimetleri oyunculara ver (kaybolmasın). */
+    public void flushAll() {
+        for (UUID uuid : new ArrayList<>(loots.keySet())) {
+            Player p = Bukkit.getPlayer(uuid);
+            if (p != null && openInventories.contains(uuid)) p.closeInventory();   // kalanı loots'a yazar
+            List<ItemStack> items = loots.get(uuid);
+            if (p != null && p.isOnline() && items != null) giveOrDrop(p, items);
+            finish(uuid);
+        }
+    }
+
+    private void giveOrDrop(Player p, List<ItemStack> items) {
+        for (ItemStack it : items) {
+            if (it == null || it.getType() == Material.AIR) continue;
+            Map<Integer, ItemStack> left = p.getInventory().addItem(it);
+            for (ItemStack rest : left.values()) {
+                p.getWorld().dropItemNaturally(p.getLocation(), rest);
+            }
+        }
+    }
+
+    private void sendBar(Player p, int seconds) {
+        p.sendActionBar(Component.text("GANİMET: ", NamedTextColor.YELLOW, TextDecoration.BOLD)
+                .append(Component.text(seconds + " saniye", NamedTextColor.WHITE)));
+    }
+}
+
+// ==========================================================
+// DOSYA: src/main/java/com/zornoely/duel/InviteManager.java
+// ==========================================================
+package com.zornoely.duel;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+
+public class InviteManager {
+    private static final long EXPIRE_MS = 5 * 60 * 1000L;
+
+    public static class Invite {
+        public final UUID inviter, target;
+        public final ArenaType mode;
+        public final long createdAt;
+        public Invite(UUID inviter, UUID target, ArenaType mode) {
+            this.inviter = inviter;
+            this.target = target;
+            this.mode = mode;
+            this.createdAt = System.currentTimeMillis();
+        }
+        public boolean isExpired() { return System.currentTimeMillis() - createdAt > EXPIRE_MS; }
+    }
+
+    private final ZornoElyDuel plugin;
+    private final Map<UUID, Invite> invites = new HashMap<>();
+
+    public InviteManager(ZornoElyDuel plugin) { this.plugin = plugin; }
+
+    public void createInvite(UUID inviter, UUID target, ArenaType mode) {
+        invites.put(inviter, new Invite(inviter, target, mode));
+    }
+
+    public Invite getInvite(UUID inviter) {
+        Invite inv = invites.get(inviter);
+        if (inv != null && inv.isExpired()) { invites.remove(inviter); return null; }
+        return inv;
+    }
+
+    public void removeInvite(UUID inviter) { invites.remove(inviter); }
+
+    /** Oyuncu çıkınca: attığı ve aldığı davetler silinir. */
+    public void removeAll(UUID uuid) {
+        invites.remove(uuid);
+        invites.values().removeIf(i -> i.target.equals(uuid));
+    }
+
+    public void cleanupExpired() {
+        invites.entrySet().removeIf(e -> e.getValue().isExpired());
+    }
+}
+
+// ==========================================================
+// DOSYA: src/main/java/com/zornoely/duel/GUI.java
+// ==========================================================
+package com.zornoely.duel;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.Material;
+import org.bukkit.entity.Player;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.InventoryHolder;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class GUI {
+    public static final Component QUEUE_TITLE  = Component.text("» PvP Sırası", NamedTextColor.DARK_GRAY);
+    public static final Component INVITE_TITLE = Component.text("» Düello Modu Seç", NamedTextColor.DARK_GRAY);
+
+    public static class DuelHolder implements InventoryHolder {
+        private final String type;
+        private Inventory inventory;
+        public DuelHolder(String type) { this.type = type; }
+        public String getType() { return type; }
+        void setInventory(Inventory inventory) { this.inventory = inventory; }
+        @Override public Inventory getInventory() { return inventory; }
+    }
+
+    private static String rule(String label, boolean open) {
+        return ChatColor.DARK_GRAY + "▪ " + ChatColor.GRAY + label + ": "
+                + (open ? ChatColor.GREEN + "Açık" : ChatColor.RED + "Kapalı");
+    }
+
+    private static String stat(String label, ChatColor color, int value) {
+        return ChatColor.DARK_GRAY + "▪ " + ChatColor.GRAY + label + ": " + color + value;
+    }
+
+    public static void openQueue(Player p, ZornoElyDuel plugin) {
+        DuelHolder holder = new DuelHolder("queue");
+        Inventory inv = Bukkit.createInventory(holder, 27, QUEUE_TITLE);
+        holder.setInventory(inv);
+
+        QueueManager qm = plugin.getQueueManager();
+        DuelManager dm = plugin.getDuelManager();
+        boolean inElytra = qm.isInQueue(p.getUniqueId(), ArenaType.ELYTRA);
+        boolean inTrap   = qm.isInQueue(p.getUniqueId(), ArenaType.TRAP);
+
+        List<String> elytraLore = new ArrayList<>();
+        elytraLore.add(rule("Elytra kullanımı", true));
+        elytraLore.add(rule("Blok koyma", false));
+        elytraLore.add("");
+        elytraLore.add(stat("Sıradaki Oyuncu", ChatColor.AQUA, qm.getQueue(ArenaType.ELYTRA).size()));
+        elytraLore.add(stat("Aktif Maç", ChatColor.AQUA, dm.countActive(ArenaType.ELYTRA)));
+        elytraLore.add("");
+        elytraLore.add(inElytra ? ChatColor.RED + "» Çıkmak için tıkla!" : ChatColor.YELLOW + "» Sıraya girmek için tıkla!");
+        inv.setItem(11, createItem(Material.ELYTRA, ChatColor.AQUA + "" + ChatColor.BOLD + "ELYTRA PVP", elytraLore));
+
+        List<String> trapLore = new ArrayList<>();
+        trapLore.add(rule("Ağ ve Blok", true));
+        trapLore.add(rule("Elytra", true));
+        trapLore.add("");
+        trapLore.add(stat("Sıradaki Oyuncu", ChatColor.GOLD, qm.getQueue(ArenaType.TRAP).size()));
+        trapLore.add(stat("Aktif Maç", ChatColor.GOLD, dm.countActive(ArenaType.TRAP)));
+        trapLore.add("");
+        trapLore.add(inTrap ? ChatColor.RED + "» Çıkmak için tıkla!" : ChatColor.YELLOW + "» Sıraya girmek için tıkla!");
+        inv.setItem(15, createItem(Material.COBWEB, ChatColor.GOLD + "" + ChatColor.BOLD + "TRAP PVP", trapLore));
+
+        p.openInventory(inv);
+    }
+
+    public static void openInvite(Player p, Player target) {
+        DuelHolder holder = new DuelHolder("invite");
+        Inventory inv = Bukkit.createInventory(holder, 27, INVITE_TITLE);
+        holder.setInventory(inv);
+
+        List<String> elytraLore = new ArrayList<>();
+        elytraLore.add(rule("Blok", false));
+        elytraLore.add(rule("Ağ", false));
+        elytraLore.add(rule("Elytra", true));
+        elytraLore.add("");
+        elytraLore.add(ChatColor.YELLOW + "Tıkla ve " + target.getName() + " oyuncusuna gönder!");
+        inv.setItem(11, createItem(Material.ELYTRA, ChatColor.AQUA + "" + ChatColor.BOLD + "Elytra PvP Daveti", elytraLore));
+
+        List<String> trapLore = new ArrayList<>();
+        trapLore.add(rule("Blok", true));
+        trapLore.add(rule("Ağ", true));
+        trapLore.add(rule("Elytra", true));
+        trapLore.add("");
+        trapLore.add(ChatColor.YELLOW + "Tıkla ve " + target.getName() + " oyuncusuna gönder!");
+        inv.setItem(15, createItem(Material.COBWEB, ChatColor.GOLD + "" + ChatColor.BOLD + "Trap PvP Daveti", trapLore));
+
+        p.openInventory(inv);
+    }
+
+    private static ItemStack createItem(Material mat, String name, List<String> lore) {
+        ItemStack item = new ItemStack(mat);
+        ItemMeta meta = item.getItemMeta();
+        meta.setDisplayName(name);
+        meta.setLore(lore);
+        item.setItemMeta(meta);
+        return item;
+    }
+}
+
+// ==========================================================
+// DOSYA: src/main/java/com/zornoely/duel/DuelCommand.java
+// ==========================================================
+package com.zornoely.duel;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.event.ClickEvent;
+import net.kyori.adventure.text.event.HoverEvent;
+import net.kyori.adventure.text.format.NamedTextColor;
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.Location;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandExecutor;
+import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
+import org.bukkit.entity.Player;
+import org.bukkit.metadata.FixedMetadataValue;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.UUID;
+
+public class DuelCommand implements CommandExecutor, TabCompleter {
+    private static final List<String> ADMIN_SUBS =
+            List.of("create", "delete", "sil", "setspawn1", "setspawn2", "settype", "tp");
+
+    private final ZornoElyDuel plugin;
+
+    public DuelCommand(ZornoElyDuel plugin) { this.plugin = plugin; }
+
+    private boolean isAdmin(CommandSender s) {
+        return s.hasPermission("zornoely.admin") || s.isOp();
+    }
+
+    /** Admin değilse mesaj atar ve true döner. */
+    private boolean denyIfNotAdmin(Player p) {
+        if (isAdmin(p)) return false;
+        p.sendMessage(ChatColor.RED + "Yetkin yok!");
+        return true;
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage(ChatColor.RED + "Sadece oyuncular kullanabilir.");
+            return true;
+        }
+        if (args.length == 0) {
+            p.sendMessage(ChatColor.RED + "Kullanım: /duel <davet|kabul|reddet|menu|sandik|berabere|list>");
+            return true;
+        }
+
+        switch (args[0].toLowerCase(Locale.ROOT)) {
+            case "berabere"          -> handleBerabere(p);
+            case "list"              -> handleList(p);
+            case "tp"                -> handleTp(p, args);
+            case "settype"           -> handleSetType(p, args);
+            case "create"            -> handleCreate(p, args);
+            case "delete", "sil"     -> handleDelete(p, args);
+            case "setspawn1"         -> handleSetSpawn(p, args, 1);
+            case "setspawn2"         -> handleSetSpawn(p, args, 2);
+            case "sandik", "sandık"  -> plugin.getLootManager().openLoot(p);
+            case "menu", "menü"      -> GUI.openQueue(p, plugin);
+            case "davet"             -> handleDavet(p, args);
+            case "kabul"             -> handleKabul(p, args);
+            case "reddet"            -> handleReddet(p, args);
+            default -> p.sendMessage(ChatColor.RED + "Bilinmeyen komut: " + args[0]);
+        }
+        return true;
+    }
+
+    /** Berabere artık karşılıklı: iki oyuncu da yazmalı (aksi halde kaybeden kaçabilirdi). */
+    private void handleBerabere(Player p) {
+        Duel duel = plugin.getDuelManager().getDuel(p.getUniqueId());
+        if (duel == null) {
+            p.sendMessage(ChatColor.RED + "Aktif bir düelloda değilsiniz!");
+            return;
+        }
+        UUID oppId = duel.getOpponent(p.getUniqueId());
+        Player opp = oppId != null ? Bukkit.getPlayer(oppId) : null;
+
+        if (oppId != null && duel.getDrawVotes().contains(oppId)) {
+            plugin.getDuelManager().endDuel(duel, null, "DRAW");
+            String msg = ChatColor.YELLOW + "Düello berabere sonlandırıldı!";
+            p.sendMessage(msg);
+            if (opp != null && opp.isOnline()) opp.sendMessage(msg);
+            plugin.sendToHub(p);
+            if (opp != null && opp.isOnline()) plugin.sendToHub(opp);
+            return;
+        }
+
+        if (!duel.getDrawVotes().add(p.getUniqueId())) {
+            p.sendMessage(ChatColor.YELLOW + "Zaten berabere teklif ettin, rakibin kabul etmesini bekle.");
+            return;
+        }
+        p.sendMessage(ChatColor.YELLOW + "Berabere teklifin gönderildi. Rakibin de /duel berabere yazarsa düello biter.");
+        if (opp != null && opp.isOnline()) {
+            opp.sendMessage(ChatColor.YELLOW + p.getName() + " berabere teklif ediyor! Kabul etmek için: /duel berabere");
+        }
+    }
+
+    private void handleList(Player p) {
+        if (plugin.getArenaManager().getAll().isEmpty()) {
+            p.sendMessage(ChatColor.RED + "Hiç arena yok!");
+            return;
+        }
+        p.sendMessage(ChatColor.YELLOW + "--- Arena Listesi ---");
+        boolean admin = isAdmin(p);
+        for (Arena a : plugin.getArenaManager().getAll()) {
+            Component line = Component.text("- ", NamedTextColor.GRAY)
+                    .append(Component.text(a.getName(), NamedTextColor.WHITE))
+                    .append(Component.text(" [", NamedTextColor.DARK_GRAY))
+                    .append(a.isBusy() ? Component.text("DOLU", NamedTextColor.RED)
+                                       : Component.text("BOŞ", NamedTextColor.GREEN))
+                    .append(Component.text("]", NamedTextColor.DARK_GRAY))
+                    .append(Component.text(" (Tip: ", NamedTextColor.GRAY))
+                    .append(Component.text(a.getType().name(), NamedTextColor.YELLOW))
+                    .append(Component.text(")", NamedTextColor.GRAY));
+            if (admin) {
+                line = line.append(Component.text(" [IŞINLAN]", NamedTextColor.GREEN)
+                        .clickEvent(ClickEvent.runCommand("/duel tp " + a.getName()))
+                        .hoverEvent(HoverEvent.showText(Component.text("Arenaya ışınlan", NamedTextColor.GRAY))));
+            }
+            p.sendMessage(line);
+        }
+    }
+
+    private void handleTp(Player p, String[] args) {
+        if (denyIfNotAdmin(p)) return;
+        if (args.length < 2) { p.sendMessage(ChatColor.RED + "Kullanım: /duel tp <arena>"); return; }
+        Arena a = plugin.getArenaManager().get(args[1]);
+        if (a == null) { p.sendMessage(ChatColor.RED + "Arena bulunamadı!"); return; }
+        Location l = a.getSpawn1();
+        if (l == null) { p.sendMessage(ChatColor.RED + "Spawn 1 ayarlanmamış veya dünyası yüklü değil!"); return; }
+        p.teleport(l);
+        p.sendMessage(ChatColor.GREEN + "Işınlandın: " + a.getName());
+    }
+
+    private void handleSetType(Player p, String[] args) {
+        if (denyIfNotAdmin(p)) return;
+        if (args.length < 3) { p.sendMessage(ChatColor.RED + "Kullanım: /duel settype <arena> <elytra|trap|hepsi>"); return; }
+        Arena a = plugin.getArenaManager().get(args[1]);
+        if (a == null) { p.sendMessage(ChatColor.RED + "Arena bulunamadı!"); return; }
+        ArenaType t = ArenaType.fromString(args[2]);
+        if (t == null) { p.sendMessage(ChatColor.RED + "Geçersiz tip! Kullan: elytra, trap veya hepsi"); return; }
+        a.setType(t);
+        plugin.getArenaManager().save();
+        p.sendMessage(ChatColor.GREEN + "Arena " + a.getName() + " tipi: " + t);
+    }
+
+    private void handleCreate(Player p, String[] args) {
+        if (denyIfNotAdmin(p)) return;
+        if (args.length < 2) { p.sendMessage(ChatColor.RED + "Kullanım: /duel create <arena>"); return; }
+        if (!ArenaManager.isValidName(args[1])) {
+            p.sendMessage(ChatColor.RED + "Arena adı sadece harf, rakam, _ ve - içerebilir (en fazla 32 karakter).");
+            return;
+        }
+        Arena created = plugin.getArenaManager().create(args[1]);
+        if (created == null) {
+            p.sendMessage(ChatColor.RED + "Bu isimde arena zaten var!");
+            return;
+        }
+        plugin.getArenaManager().save();
+        p.sendMessage(ChatColor.GREEN + "Arena oluşturuldu: " + created.getName() + " (Tip: HEPSI)");
+    }
+
+    private void handleDelete(Player p, String[] args) {
+        if (denyIfNotAdmin(p)) return;
+        if (args.length < 2) { p.sendMessage(ChatColor.RED + "Kullanım: /duel delete <arena>"); return; }
+        Arena a = plugin.getArenaManager().get(args[1]);
+        if (a == null) { p.sendMessage(ChatColor.RED + "Arena bulunamadı!"); return; }
+        if (a.isBusy()) { p.sendMessage(ChatColor.RED + "Arenada şu an maç var, silinemez!"); return; }
+        plugin.getArenaManager().delete(a.getName());
+        plugin.getArenaManager().save();
+        p.sendMessage(ChatColor.GREEN + "Arena silindi: " + a.getName());
+    }
+
+    private void handleSetSpawn(Player p, String[] args, int num) {
+        if (denyIfNotAdmin(p)) return;
+        if (args.length < 2) { p.sendMessage(ChatColor.RED + "Kullanım: /duel setspawn" + num + " <arena>"); return; }
+        Arena a = plugin.getArenaManager().get(args[1]);
+        if (a == null) { p.sendMessage(ChatColor.RED + "Arena bulunamadı!"); return; }
+        if (num == 1) a.setSpawn1(p.getLocation());
+        else          a.setSpawn2(p.getLocation());
+        plugin.getArenaManager().save();
+        p.sendMessage(ChatColor.GREEN + "Spawn " + num + " ayarlandı: " + a.getName());
+    }
+
+    private void handleDavet(Player p, String[] args) {
+        if (args.length < 2) { p.sendMessage(ChatColor.RED + "Kullanım: /duel davet <oyuncu>"); return; }
+        Player target = Bukkit.getPlayerExact(args[1]);
+        if (target == null) { p.sendMessage(ChatColor.RED + "Oyuncu bulunamadı!"); return; }
+        if (target.equals(p)) { p.sendMessage(ChatColor.RED + "Kendine davet atamazsın!"); return; }
+        if (plugin.getDuelManager().isInDuel(target.getUniqueId())) {
+            p.sendMessage(ChatColor.RED + "Bu oyuncu şu an düelloda!");
+            return;
+        }
+        if (plugin.getLootManager().hasLoot(p.getUniqueId())) {
+            p.sendMessage(ChatColor.RED + "Önce ganimetini almalısın! (/duel sandik)");
+            return;
+        }
+        p.setMetadata("duel_target", new FixedMetadataValue(plugin, target.getUniqueId().toString()));
+        GUI.openInvite(p, target);
+    }
+
+    private void handleKabul(Player p, String[] args) {
+        if (args.length < 2) { p.sendMessage(ChatColor.RED + "Kullanım: /duel kabul <oyuncu>"); return; }
+        Player inviter = Bukkit.getPlayerExact(args[1]);
+        if (inviter == null) { p.sendMessage(ChatColor.RED + "Oyuncu offline!"); return; }
+        InviteManager.Invite inv = plugin.getInviteManager().getInvite(inviter.getUniqueId());
+        if (inv == null || !inv.target.equals(p.getUniqueId())) {
+            p.sendMessage(ChatColor.RED + "Aktif davet yok!");
+            return;
+        }
+        DuelManager dm = plugin.getDuelManager();
+        if (dm.isInDuel(inviter.getUniqueId())) {
+            plugin.getInviteManager().removeInvite(inviter.getUniqueId());
+            p.sendMessage(ChatColor.RED + "Davet eden oyuncu şu an düelloda!");
+            return;
+        }
+        if (plugin.getLootManager().hasLoot(p.getUniqueId())) {
+            p.sendMessage(ChatColor.RED + "Önce ganimetini almalısın! (/duel sandik)");
+            return;
+        }
+        if (plugin.getLootManager().hasLoot(inviter.getUniqueId())) {
+            p.sendMessage(ChatColor.RED + "Davet eden oyuncu şu an ganimetini topluyor, birazdan tekrar dene.");
+            return;
+        }
+        if (plugin.getArenaManager().findAvailable(inv.mode) == null) {
+            p.sendMessage(ChatColor.RED + "Şu an boş arena yok, biraz sonra tekrar dene.");
+            return;
+        }
+        plugin.getInviteManager().removeInvite(inviter.getUniqueId());
+        if (dm.startDuel(inviter, p, inv.mode) == null) {
+            p.sendMessage(ChatColor.RED + "Düello başlatılamadı!");
+        }
+    }
+
+    private void handleReddet(Player p, String[] args) {
+        if (args.length < 2) { p.sendMessage(ChatColor.RED + "Kullanım: /duel reddet <oyuncu>"); return; }
+        Player inviter = Bukkit.getPlayerExact(args[1]);
+        if (inviter == null) { p.sendMessage(ChatColor.RED + "Oyuncu offline!"); return; }
+        InviteManager.Invite inv = plugin.getInviteManager().getInvite(inviter.getUniqueId());
+        if (inv == null || !inv.target.equals(p.getUniqueId())) {
+            p.sendMessage(ChatColor.RED + "Aktif davet yok!");
+            return;
+        }
+        plugin.getInviteManager().removeInvite(inviter.getUniqueId());
+        p.sendMessage(ChatColor.GREEN + "Daveti reddettin.");
+        inviter.sendMessage(ChatColor.RED + p.getName() + " davetini reddetti.");
+    }
+
+    @Override
+    public List<String> onTabComplete(CommandSender sender, Command cmd, String label, String[] args) {
+        List<String> out = new ArrayList<>();
+        boolean admin = isAdmin(sender);
+
+        if (args.length == 1) {
+            List<String> opts = new ArrayList<>(List.of("davet", "kabul", "reddet", "menu", "sandik", "berabere", "list"));
+            if (admin) opts.addAll(ADMIN_SUBS);
+            String typed = args[0].toLowerCase(Locale.ROOT);
+            for (String s : opts) if (s.startsWith(typed)) out.add(s);
+        } else if (args.length == 2) {
+            String sub = args[0].toLowerCase(Locale.ROOT);
+            String typed = args[1].toLowerCase(Locale.ROOT);
+            if (List.of("davet", "kabul", "reddet").contains(sub)) {
+                for (Player pl : Bukkit.getOnlinePlayers())
+                    if (pl.getName().toLowerCase(Locale.ROOT).startsWith(typed)) out.add(pl.getName());
+            } else if (admin && ADMIN_SUBS.contains(sub)) {
+                for (String name : plugin.getArenaManager().getNames())
+                    if (name.toLowerCase(Locale.ROOT).startsWith(typed)) out.add(name);
+            }
+        } else if (args.length == 3 && admin && args[0].equalsIgnoreCase("settype")) {
+            String typed = args[2].toLowerCase(Locale.ROOT);
+            for (String s : List.of("elytra", "trap", "hepsi"))
+                if (s.startsWith(typed)) out.add(s);
+        }
+        return out;
+    }
+}
+
+// ==========================================================
+// DOSYA: src/main/java/com/zornoely/duel/DuelListener.java
+// ==========================================================
+package com.zornoely.duel;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.event.ClickEvent;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.format.TextDecoration;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.entity.LivingEntity;
+import org.bukkit.entity.Player;
+import org.bukkit.entity.Projectile;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.inventory.InventoryAction;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryCloseEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.player.PlayerCommandPreprocessEvent;
+import org.bukkit.event.player.PlayerInteractEntityEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
+import org.bukkit.inventory.EquipmentSlot;
+import org.bukkit.inventory.InventoryHolder;
+import org.bukkit.inventory.ItemStack;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.UUID;
+
+public class DuelListener implements Listener {
+    private final ZornoElyDuel plugin;
+
+    public DuelListener(ZornoElyDuel plugin) { this.plugin = plugin; }
+
+    // ---------------------------------------------------------------
+    // Düello sırasında sadece /duel berabere kullanılabilir
+    // ---------------------------------------------------------------
+    @EventHandler(priority = EventPriority.LOW)
+    public void onCommand(PlayerCommandPreprocessEvent e) {
+        Player p = e.getPlayer();
+        if (!plugin.getDuelManager().isInDuel(p.getUniqueId())) return;
+
+        String[] parts = e.getMessage().trim().toLowerCase(Locale.ROOT).split("\s+");
+        String label = parts[0].startsWith("/") ? parts[0].substring(1) : parts[0];
+        boolean isDuelCmd = label.equals("duel") || label.equals("zornoelyduel:duel");
+        if (isDuelCmd && parts.length >= 2 && parts[1].equals("berabere")) return;
+
+        e.setCancelled(true);
+        p.sendMessage(ChatColor.RED + "Düellodayken başka komut kullanamazsınız! (Berabere: /duel berabere)");
+    }
+
+    // ---------------------------------------------------------------
+    // Ölüm -> ganimet
+    // ---------------------------------------------------------------
+    @EventHandler
+    public void onDeath(PlayerDeathEvent e) {
+        Player victim = e.getEntity();
+        DuelManager dm = plugin.getDuelManager();
+        Duel duel = dm.getDuel(victim.getUniqueId());
+        if (duel == null) return;
+
+        // Kazanan HER ZAMAN rakiptir (dışarıdan biri vurduysa ganimeti o alamaz)
+        UUID oppId = duel.getOpponent(victim.getUniqueId());
+        Player winner = oppId != null ? Bukkit.getPlayer(oppId) : null;
+        boolean winnerOnline = winner != null && winner.isOnline();
+
+        // DİKKAT: getContents() zırh + offhand'i de içerir. Çifte saymamak için bölümler ayrı alınır.
+        List<ItemStack> loot = new ArrayList<>();
+        collect(loot, victim.getInventory().getStorageContents());
+        collect(loot, victim.getInventory().getArmorContents());
+        collect(loot, victim.getInventory().getExtraContents());
+
+        boolean giveLoot = winnerOnline && !loot.isEmpty();
+        if (giveLoot) {
+            victim.getInventory().clear();
+            victim.getInventory().setArmorContents(new ItemStack[4]);
+            victim.getInventory().setItemInOffHand(new ItemStack(Material.AIR));
+            e.getDrops().clear();
+            e.setDroppedExp(0);
+        }
+
+        // Ganimet varsa arena, ganimet süreci bitene kadar meşgul kalır
+        dm.endDuel(duel, oppId, "DEATH", giveLoot);
+        if (giveLoot) plugin.getLootManager().setLoot(winner.getUniqueId(), loot, duel.getArenaName());
+
+        if (winnerOnline) {
+            winner.sendMessage(ChatColor.GREEN + "Düelloyu kazandın!");
+            if (!giveLoot) plugin.sendToHub(winner);
+        }
+        victim.sendMessage(ChatColor.RED + "Düelloyu kaybettin!");
+        dm.markKilled(victim.getUniqueId());
+    }
+
+    private static void collect(List<ItemStack> out, ItemStack[] items) {
+        if (items == null) return;
+        for (ItemStack it : items) {
+            if (it != null && it.getType() != Material.AIR) out.add(it.clone());
+        }
+    }
+
+    @EventHandler
+    public void onRespawn(PlayerRespawnEvent e) {
+        Player p = e.getPlayer();
+        if (plugin.getDuelManager().wasKilledInDuel(p.getUniqueId())) {
+            Bukkit.getScheduler().runTaskLater(plugin, () -> plugin.sendToHub(p), 5L);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Blok koyma: Elytra modunda kapalı, Trap'te açık (maç sonunda geri alınır)
+    // ---------------------------------------------------------------
+    @EventHandler(ignoreCancelled = true)
+    public void onBlockPlace(BlockPlaceEvent e) {
+        Player p = e.getPlayer();
+        Duel duel = plugin.getDuelManager().getDuel(p.getUniqueId());
+        if (duel == null) return;
+
+        if (duel.getMode() == ArenaType.ELYTRA) {
+            e.setCancelled(true);
+            p.sendMessage(ChatColor.RED + "Bu modda blok koymak kapalı!");
+            return;
+        }
+        Arena arena = plugin.getArenaManager().get(duel.getArenaName());
+        if (arena != null) arena.recordBlock(e.getBlockReplacedState());
+    }
+
+    // ---------------------------------------------------------------
+    // Düellocu sadece rakibine vurabilsin, dışarıdan kimse karışamasın
+    // ---------------------------------------------------------------
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onDamage(EntityDamageByEntityEvent e) {
+        if (!(e.getEntity() instanceof Player victim)) return;
+
+        Player attacker = null;
+        if (e.getDamager() instanceof Player direct) {
+            attacker = direct;
+        } else if (e.getDamager() instanceof Projectile proj && proj.getShooter() instanceof Player shooter) {
+            attacker = shooter;
+        }
+        if (attacker == null || attacker.equals(victim)) return;
+
+        Duel victimDuel = plugin.getDuelManager().getDuel(victim.getUniqueId());
+        Duel attackerDuel = plugin.getDuelManager().getDuel(attacker.getUniqueId());
+        if (victimDuel == null && attackerDuel == null) return;   // düello dışı, karışma
+        if (victimDuel != attackerDuel) e.setCancelled(true);     // aynı düelloda değiller
+    }
+
+    // ---------------------------------------------------------------
+    // Menüler ve ganimet sandığı
+    // ---------------------------------------------------------------
+    @EventHandler
+    public void onInventoryClick(InventoryClickEvent e) {
+        if (!(e.getWhoClicked() instanceof Player p)) return;
+        InventoryHolder holder = e.getInventory().getHolder();
+
+        if (holder instanceof GUI.DuelHolder gui) {
+            e.setCancelled(true);
+
+            int slot = e.getRawSlot();
+            ArenaType mode = slot == 11 ? ArenaType.ELYTRA
+                           : slot == 15 ? ArenaType.TRAP : null;
+            if (mode == null) return;   // boş slota tıklamak hiçbir şeyi bozmasın
+
+            if (gui.getType().equals("queue")) {
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    p.closeInventory();
+                    plugin.getQueueManager().toggleQueue(p, mode);
+                });
+            } else if (gui.getType().equals("invite")) {
+                if (!p.hasMetadata("duel_target")) {
+                    Bukkit.getScheduler().runTask(plugin, () -> p.closeInventory());
+                    return;
+                }
+                String raw = p.getMetadata("duel_target").get(0).asString();
+                p.removeMetadata("duel_target", plugin);   // sadece geçerli bir slota tıklanınca silinir
+
+                Player found = null;
+                try { found = Bukkit.getPlayer(UUID.fromString(raw)); }
+                catch (IllegalArgumentException ignored) { }
+                final Player target = found;
+
+                Bukkit.getScheduler().runTask(plugin, () -> sendInvite(p, target, mode));
+            }
+        } else if (holder instanceof LootManager.LootHolder) {
+            int raw = e.getRawSlot();
+            boolean clickedTop = raw >= 0 && raw < e.getInventory().getSize();
+            InventoryAction action = e.getAction();
+            
+            // DÜZELTME 1: Sandıktan eşya almak serbest, oyuncunun kendi envanterinden shift-click ile sandığa eşya atması yasak
+            if (!clickedTop && action == InventoryAction.MOVE_TO_OTHER_INVENTORY) {
+                e.setCancelled(true);
+            }
+        }
+    }
+
+    private static boolean isTakeAction(InventoryAction a) {
+        return switch (a) {
+            case PICKUP_ALL, PICKUP_HALF, PICKUP_ONE, PICKUP_SOME,
+                 MOVE_TO_OTHER_INVENTORY, COLLECT_TO_CURSOR,
+                 DROP_ALL_SLOT, DROP_ONE_SLOT -> true;
+            default -> false;
+        };
+    }
+
+    private void sendInvite(Player p, Player target, ArenaType mode) {
+        p.closeInventory();
+        if (!p.isOnline()) return;
+        if (target == null || !target.isOnline()) {
+            p.sendMessage(ChatColor.RED + "Hedef oyuncu offline!");
+            return;
+        }
+        if (plugin.getDuelManager().isInDuel(target.getUniqueId())) {
+            p.sendMessage(ChatColor.RED + "Hedef oyuncu şu an düelloda!");
+            return;
+        }
+        plugin.getInviteManager().createInvite(p.getUniqueId(), target.getUniqueId(), mode);
+        p.sendMessage(ChatColor.GREEN + target.getName() + " oyuncusuna " + mode.getDisplayName() + " daveti gönderildi!");
+
+        Component accept = Component.text("[KABUL]", NamedTextColor.GREEN, TextDecoration.BOLD)
+                .clickEvent(ClickEvent.runCommand("/duel kabul " + p.getName()));
+        Component reject = Component.text("[RED]", NamedTextColor.RED, TextDecoration.BOLD)
+                .clickEvent(ClickEvent.runCommand("/duel reddet " + p.getName()));
+        Component msg = Component.text(p.getName() + " sana " + mode.getDisplayName() + " daveti yolladı! ", NamedTextColor.YELLOW)
+                .append(accept)
+                .append(Component.space())
+                .append(reject);
+        target.sendMessage(msg);
+    }
+
+    @EventHandler
+    public void onInventoryDrag(InventoryDragEvent e) {
+        InventoryHolder holder = e.getInventory().getHolder();
+        if (holder instanceof GUI.DuelHolder) {
+            e.setCancelled(true);
+            return;
+        }
+        if (holder instanceof LootManager.LootHolder) {
+            int topSize = e.getInventory().getSize();
+            for (int slot : e.getRawSlots()) {
+                if (slot < topSize) {   // sandığın üstüne sürükleyerek eşya koymayı engelle
+                    e.setCancelled(true);
+                    return;
+                }
+            }
+        }
+    }
+
+    @EventHandler
+    public void onInventoryClose(InventoryCloseEvent e) {
+        if (!(e.getPlayer() instanceof Player p)) return;
+        InventoryHolder holder = e.getInventory().getHolder();
+
+        if (holder instanceof LootManager.LootHolder) {
+            plugin.getLootManager().onInventoryClose(p, e.getInventory());
+        } else if (holder instanceof GUI.DuelHolder gui && gui.getType().equals("invite")) {
+            p.removeMetadata("duel_target", plugin);   // ESC ile kapatılırsa eski hedef kalmasın
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Çıkış
+    // ---------------------------------------------------------------
+    @EventHandler
+    public void onQuit(PlayerQuitEvent e) {
+        Player p = e.getPlayer();
+        UUID uuid = p.getUniqueId();
+        DuelManager dm = plugin.getDuelManager();
+
+        plugin.getQueueManager().removeFromAll(uuid);
+        plugin.getInviteManager().removeAll(uuid);
+
+        boolean wasInArena = false;
+        Duel duel = dm.getDuel(uuid);
+        if (duel != null) {
+            wasInArena = true;
+            UUID oppId = duel.getOpponent(uuid);
+            Player opp = oppId != null ? Bukkit.getPlayer(oppId) : null;
+            dm.endDuel(duel, oppId, "QUIT");
+            if (opp != null && opp.isOnline()) {
+                opp.sendMessage(ChatColor.GREEN + "Rakip çıktı, düelloyu kazandın!");
+                plugin.sendToHub(opp);
+            }
+        }
+        if (plugin.getLootManager().hasLoot(uuid)) wasInArena = true;
+
+        plugin.getLootManager().remove(uuid);
+        dm.forget(uuid);   // ölüp respawn olmadan çıkanın işareti kalmasın
+        p.removeMetadata("duel_target", plugin);
+
+        // Arenada çıkan oyuncu tekrar girince arenanın ortasında doğmasın
+        if (wasInArena) {
+            Location spawn = plugin.getFallbackSpawn();
+            if (spawn != null) p.teleport(spawn);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // NPC'ye sağ tık -> sıra menüsü
+    // ---------------------------------------------------------------
+    @EventHandler
+    public void onInteractEntity(PlayerInteractEntityEvent e) {
+        if (e.getHand() != EquipmentSlot.HAND) return;
+        if (!(e.getRightClicked() instanceof LivingEntity entity)) return;
+        if (entity instanceof Player) return;
+
+        Component customName = entity.customName();
+        if (customName == null) return;
+
+        String stripped = PlainTextComponentSerializer.plainText().serialize(customName);
+
+        if (stripped.contains("Duel") || stripped.contains("PvP") || stripped.contains("ZornoEly")) {
+            e.setCancelled(true);
+            GUI.openQueue(e.getPlayer(), plugin);
+        }
+    }
+}
+
+// ==========================================================
+// DOSYA: src/main/resources/plugin.yml
+// ==========================================================
+name: ZornoElyDuel
+version: 1.0.1
+main: com.zornoely.duel.ZornoElyDuel
+api-version: '1.21'
+author: ZornoEly
+description: Duel & PVP system
+commands:
+  duel:
+    description: Duel system
+    usage: /duel
+permissions:
+  zornoely.admin:
+    description: Arena yönetimi
+    default: op
+
+// ==========================================================
+// DOSYA: src/main/resources/config.yml
+// ==========================================================
+settings:
+  duel-duration-minutes: 15
+  loot-duration-seconds: 20
+  hub-command: "hub"
